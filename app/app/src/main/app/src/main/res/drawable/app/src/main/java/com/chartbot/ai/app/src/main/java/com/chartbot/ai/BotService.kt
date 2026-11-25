@@ -1,0 +1,593 @@
+package com.chartbot.ai
+
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.util.Base64
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.Locale
+import kotlin.math.abs
+
+class BotService : Service(), TextToSpeech.OnInitListener {
+
+    private lateinit var windowManager: WindowManager
+    private lateinit var floatingRoot: LinearLayout
+    private lateinit var bubbleView: TextView
+    private lateinit var panelView: LinearLayout
+    private lateinit var statusLabel: TextView
+    private lateinit var resultLabel: TextView
+    private lateinit var analyzeBtn: Button
+    private lateinit var autoBtn: Button
+    private lateinit var layoutParams: WindowManager.LayoutParams
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var bgThread: HandlerThread? = null
+    private var bgHandler: Handler? = null
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+
+    @Volatile
+    private var latestBitmap: Bitmap? = null
+    private var lastFrameTime = 0L
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var isAnalyzing = false
+    private var isAutoWatch = false
+    private var isExpanded = false
+
+    companion object {
+        private const val CHANNEL_ID = "chart_bot_channel"
+        private const val NOTIF_ID = 2026
+        private const val MODEL_ID = "gemini-3.5-flash-lite"
+
+        private val SYSTEM_PROMPT = """
+            তুমি একটি ১-মিনিট বাইনারি অপশন চার্ট অ্যানালাইসিস অ্যাসিস্ট্যান্ট (বিশেষ করে OTC পেয়ার ও শর্ট-টার্ম ক্যান্ডেলের জন্য)।
+            তোমার কাজ চার্টের স্ক্রিনশট দেখে তিনটি পরিষ্কার সিদ্ধান্তের যেকোনো একটি দেওয়া: BUY (CALL), SELL (PUT), অথবা WAIT (No Trade)।
+
+            নির্দেশাবলি:
+            ১. কোনো অপ্রয়োজনীয় ভূমিকা বা দীর্ঘ ব্যাখ্যা দেবে না। সরাসরি নিচের ফরম্যাটে উত্তর দেবে:
+               - সিদ্ধান্ত: [BUY (CALL) / SELL (PUT) / WAIT (No Trade)]
+               - মূল কারণ: (সাপোর্ট/রেজিস্ট্যান্স, ট্রেন্ড বা ক্যান্ডেলের রিজেকশন ১-২ লাইনে)
+               - সেফটি মার্জিন ও সতর্কতা: (কোথায় এন্ট্রি নিরাপদ বা কেন WAIT করতে হবে, ১ লাইনে)
+
+            ২. BUY (CALL) বলবে যখন: দাম স্পষ্ট Support লেভেল বা জোনের কাছাকাছি থাকে এবং নিচের দিকে রিজেকশন/বুলিশ ক্যান্ডেল দেখা যায়।
+            ৩. SELL (PUT) বলবে যখন: দাম স্পষ্ট Resistance লেভেল বা জোনের কাছাকাছি থাকে এবং উপরের দিকে রিজেকশন/বিয়ারিশ ক্যান্ডেল দেখা যায়।
+            ৪. WAIT (No Trade) বলবে যখন: চার্ট সাইডওয়েজ/চপি বা অস্পষ্ট হয়, স্ক্রিনে চার্ট না থাকে, বা সেফটি মার্জিন ঝুঁকিপূর্ণ মনে হয়।
+            ৫. কখনোই "১০০% নিশ্চিত জিতবেন" বলবে না। ভাষা বাংলা রাখবে।
+        """.trimIndent()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        tts = TextToSpeech(this, this)
+
+        bgThread = HandlerThread("ScreenCaptureThread").apply { start() }
+        bgHandler = Handler(bgThread!!.looper)
+
+        createNotificationChannel()
+        buildFloatingUI()
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val res = tts?.setLanguage(Locale("bn", "BD"))
+            if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                tts?.setLanguage(Locale("bn", "IN"))
+            }
+            ttsReady = true
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID,
+                buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification())
+        }
+
+        val resultCode = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED)
+        val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra("data", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra("data")
+        }
+
+        if (resultCode != Activity.RESULT_OK || resultData == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        setupMediaProjection(resultCode, resultData)
+        return START_NOT_STICKY
+    }
+
+    private fun setupMediaProjection(resultCode: Int, data: Intent) {
+        virtualDisplay?.release()
+        imageReader?.close()
+        mediaProjection?.stop()
+
+        val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = mpm.getMediaProjection(resultCode, data)
+
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                mainHandler.post { stopSelf() }
+            }
+        }, bgHandler)
+
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val now = System.currentTimeMillis()
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                if (now - lastFrameTime < 450) return@setOnImageAvailableListener
+                lastFrameTime = now
+
+                val plane = image.planes[0]
+                val buffer = plane.buffer
+                val pixelStride = plane.pixelStride
+                val rowStride = plane.rowStride
+                val rowPadding = rowStride - pixelStride * width
+
+                val fullBmp = Bitmap.createBitmap(
+                    width + rowPadding / pixelStride,
+                    height,
+                    Bitmap.Config.ARGB_8888
+                )
+                fullBmp.copyPixelsFromBuffer(buffer)
+                val cropped = Bitmap.createBitmap(fullBmp, 0, 0, width, height)
+                fullBmp.recycle()
+
+                val old = latestBitmap
+                latestBitmap = cropped
+                old?.recycle()
+            } catch (_: Exception) {
+            } finally {
+                image.close()
+            }
+        }, bgHandler)
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ChartBotDisplay",
+            width,
+            height,
+            density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader?.surface,
+            null,
+            bgHandler
+        )
+    }
+
+    private fun buildFloatingUI() {
+        floatingRoot = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        val bubbleBg = GradientDrawable().apply {
+            setColor(Color.parseColor("#2563EB"))
+            cornerRadius = 60f
+            setStroke(3, Color.WHITE)
+        }
+
+        bubbleView = TextView(this).apply {
+            text = "🤖 চার্ট বট"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            background = bubbleBg
+            setPadding(36, 24, 36, 24)
+        }
+
+        val panelBg = GradientDrawable().apply {
+            setColor(Color.parseColor("#EE111827"))
+            cornerRadius = 32f
+            setStroke(2, Color.parseColor("#374151"))
+        }
+
+        panelView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = panelBg
+            setPadding(28, 24, 28, 24)
+            visibility = View.GONE
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val title = TextView(this).apply {
+            text = "🤖 চার্ট AI বট"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val minBtn = TextView(this).apply {
+            text = "  ➖  "
+            textSize = 16f
+            setTextColor(Color.parseColor("#9CA3AF"))
+            setOnClickListener { collapseToBubble() }
+        }
+
+        val closeBtn = TextView(this).apply {
+            text = "  ✖ "
+            textSize = 16f
+            setTextColor(Color.parseColor("#EF4444"))
+            setOnClickListener { stopSelf() }
+        }
+
+        header.addView(title)
+        header.addView(minBtn)
+        header.addView(closeBtn)
+
+        statusLabel = TextView(this).apply {
+            text = "চার্ট ওপেন করে নিচে চাপুন"
+            textSize = 12f
+            setTextColor(Color.parseColor("#60A5FA"))
+            setPadding(0, 12, 0, 8)
+        }
+
+        resultLabel = TextView(this).apply {
+            text = "আমাকে ট্রেডিং চার্ট দেখাও।"
+            textSize = 13f
+            setTextColor(Color.parseColor("#F3F4F6"))
+            setBackgroundColor(Color.parseColor("#1F2937"))
+            setPadding(20, 20, 20, 20)
+        }
+
+        val resultScroll = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(720, 320)
+            addView(resultLabel)
+        }
+
+        analyzeBtn = Button(this).apply {
+            text = "📊 চার্ট দেখো (BUY / SELL)"
+            textSize = 13f
+            setBackgroundColor(Color.parseColor("#10B981"))
+            setTextColor(Color.WHITE)
+            setOnClickListener { triggerAnalysis() }
+        }
+
+        autoBtn = Button(this).apply {
+            text = "🔄 অটো-ওয়াচ: OFF"
+            textSize = 12f
+            setBackgroundColor(Color.parseColor("#374151"))
+            setTextColor(Color.WHITE)
+            setOnClickListener { toggleAutoWatch() }
+        }
+
+        val btnLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, 14, 0, 0) }
+
+        panelView.addView(header)
+        panelView.addView(statusLabel)
+        panelView.addView(resultScroll)
+        panelView.addView(analyzeBtn, btnLp)
+        panelView.addView(autoBtn, btnLp)
+
+        floatingRoot.addView(bubbleView)
+        floatingRoot.addView(panelView)
+
+        layoutParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 40
+            y = 180
+        }
+
+        setupTouchDrag(bubbleView, openOnClick = true)
+        setupTouchDrag(header, openOnClick = false)
+
+        windowManager.addView(floatingRoot, layoutParams)
+    }
+
+    private fun setupTouchDrag(target: View, openOnClick: Boolean) {
+        var startX = 0
+        var startY = 0
+        var touchX = 0f
+        var touchY = 0f
+
+        target.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = layoutParams.x
+                    startY = layoutParams.y
+                    touchX = event.rawX
+                    touchY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    layoutParams.x = startX + (event.rawX - touchX).toInt()
+                    layoutParams.y = startY + (event.rawY - touchY).toInt()
+                    windowManager.updateViewLayout(floatingRoot, layoutParams)
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val dx = abs(event.rawX - touchX)
+                    val dy = abs(event.rawY - touchY)
+                    if (openOnClick && dx < 15 && dy < 15) {
+                        expandPanel()
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun expandPanel() {
+        isExpanded = true
+        bubbleView.visibility = View.GONE
+        panelView.visibility = View.VISIBLE
+        statusLabel.text = "চার্ট ওপেন করে নিচে চাপুন"
+        resultLabel.text = "আমাকে ট্রেডিং চার্ট দেখাও।"
+        speak("আমাকে ট্রেডিং চার্ট দেখাও।")
+    }
+
+    private fun collapseToBubble() {
+        isExpanded = false
+        isAutoWatch = false
+        autoBtn.text = "🔄 অটো-ওয়াচ: OFF"
+        autoBtn.setBackgroundColor(Color.parseColor("#374151"))
+        panelView.visibility = View.GONE
+        bubbleView.visibility = View.VISIBLE
+    }
+
+    private fun toggleAutoWatch() {
+        isAutoWatch = !isAutoWatch
+        if (isAutoWatch) {
+            autoBtn.text = "🔄 অটো-ওয়াচ: ON (15s)"
+            autoBtn.setBackgroundColor(Color.parseColor("#2563EB"))
+            triggerAnalysis()
+            scheduleAutoTick()
+        } else {
+            autoBtn.text = "🔄 অটো-ওয়াচ: OFF"
+            autoBtn.setBackgroundColor(Color.parseColor("#374151"))
+        }
+    }
+
+    private fun scheduleAutoTick() {
+        mainHandler.postDelayed({
+            if (isAutoWatch && isExpanded) {
+                if (!isAnalyzing) triggerAnalysis()
+                scheduleAutoTick()
+            }
+        }, 15000)
+    }
+
+    private fun triggerAnalysis() {
+        if (isAnalyzing) return
+        val apiKey = getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(MainActivity.KEY_API, "")?.trim() ?: ""
+
+        if (apiKey.isEmpty()) {
+            resultLabel.text = "API Key পাওয়া যায়নি! মূল অ্যাপে গিয়ে API Key দিন।"
+            return
+        }
+
+        isAnalyzing = true
+        analyzeBtn.isEnabled = false
+        analyzeBtn.text = "⏳ চার্ট দেখা হচ্ছে..."
+        statusLabel.text = "স্ক্রিন পড়া হচ্ছে..."
+
+        // প্যানেল সাময়িক সরিয়ে পরিষ্কার চার্ট ক্যাপচার
+        floatingRoot.visibility = View.INVISIBLE
+
+        mainHandler.postDelayed({
+            val bmp = latestBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+            floatingRoot.visibility = View.VISIBLE
+
+            if (bmp == null) {
+                isAnalyzing = false
+                analyzeBtn.isEnabled = true
+                analyzeBtn.text = "📊 চার্ট দেখো (BUY / SELL)"
+                statusLabel.text = "স্ক্রিন ফ্রেম পাওয়া যায়নি, আবার চাপুন"
+                return@postDelayed
+            }
+
+            Thread {
+                val reply = callGeminiVision(apiKey, bmp)
+                bmp.recycle()
+
+                mainHandler.post {
+                    resultLabel.text = reply
+                    when {
+                        reply.contains("BUY", ignoreCase = true) -> {
+                            statusLabel.text = "সিগন্যাল: সম্ভাব্য BUY (CALL)"
+                            statusLabel.setTextColor(Color.parseColor("#10B981"))
+                        }
+                        reply.contains("SELL", ignoreCase = true) -> {
+                            statusLabel.text = "সিগন্যাল: সম্ভাব্য SELL (PUT)"
+                            statusLabel.setTextColor(Color.parseColor("#EF4444"))
+                        }
+                        else -> {
+                            statusLabel.text = "সিগন্যাল: WAIT (No Trade)"
+                            statusLabel.setTextColor(Color.parseColor("#F59E0B"))
+                        }
+                    }
+                    speak(formatForVoice(reply))
+                    isAnalyzing = false
+                    analyzeBtn.isEnabled = true
+                    analyzeBtn.text = "📊 চার্ট দেখো (BUY / SELL)"
+                }
+            }.start()
+        }, 250)
+    }
+
+    private fun callGeminiVision(apiKey: String, bitmap: Bitmap): String {
+        return try {
+            val scaled = scaleBitmap(bitmap, 1080)
+            val baos = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 80, baos)
+            if (scaled != bitmap) scaled.recycle()
+
+            val base64Img = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+
+            val payload = JSONObject().apply {
+                put("systemInstruction", JSONObject().apply {
+                    put("parts", JSONArray().put(JSONObject().put("text", SYSTEM_PROMPT)))
+                })
+                put("contents", JSONArray().put(JSONObject().apply {
+                    put("parts", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("inlineData", JSONObject().apply {
+                                put("mimeType", "image/jpeg")
+                                put("data", base64Img)
+                            })
+                        })
+                        put(JSONObject().put("text", "এই স্ক্রিনের ১-মিনিট ট্রেডিং চার্টটি বিশ্লেষণ করো এবং নিয়ম অনুযায়ী উত্তর দাও।"))
+                    })
+                }))
+            }
+
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL_ID:generateContent")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("x-goog-api-key", apiKey)
+                connectTimeout = 20000
+                readTimeout = 25000
+                doOutput = true
+            }
+
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val responseStr = stream.bufferedReader().use { it.readText() }
+
+            if (code !in 200..299) {
+                return "API ত্রুটি ($code): $responseStr"
+            }
+
+            val json = JSONObject(responseStr)
+            json.getJSONArray("candidates")
+                .getJSONObject(0)
+                .getJSONObject("content")
+                .getJSONArray("parts")
+                .getJSONObject(0)
+                .getString("text")
+                .trim()
+        } catch (e: Exception) {
+            "সংযোগ ত্রুটি: ${e.message}"
+        }
+    }
+
+    private fun scaleBitmap(src: Bitmap, maxDim: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= maxDim && h <= maxDim) return src
+        val ratio = maxDim.toFloat() / maxOf(w, h)
+        return Bitmap.createScaledBitmap(src, (w * ratio).toInt(), (h * ratio).toInt(), true)
+    }
+
+    private fun formatForVoice(text: String): String {
+        return text
+            .replace(Regex("[*#`•\\-]+"), " ")
+            .replace("BUY (CALL)", "বাই বা কল")
+            .replace("SELL (PUT)", "সেল বা পুট")
+            .replace("WAIT (No Trade)", "ওয়েট, এখন ট্রেড নয়")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun speak(text: String) {
+        if (ttsReady && text.isNotEmpty()) {
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "chart_bot_voice")
+        }
+    }
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Chart AI Bot Service",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(channel)
+    }
+
+    private fun buildNotification(): Notification {
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Chart AI Bot চলছে")
+            .setContentText("ভাসমান বাটনে ক্লিক করে চার্ট বিশ্লেষণ করুন")
+            .setSmallIcon(R.drawable.ic_bot)
+            .build()
+    }
+
+    override fun onDestroy() {
+        isAutoWatch = false
+        super.onDestroy()
+        try {
+            windowManager.removeView(floatingRoot)
+        } catch (_: Exception) {
+        }
+        virtualDisplay?.release()
+        imageReader?.close()
+        mediaProjection?.stop()
+        bgThread?.quitSafely()
+        tts?.stop()
+        tts?.shutdown()
+    }
+}
